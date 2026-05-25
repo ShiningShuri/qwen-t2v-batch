@@ -1,0 +1,32 @@
+# Browser profiles (per-user)
+chrome-profile/
+chrome-profile-2/
+chrome-profile-3/
+edge-profile/
+profile/
+
+# Generated content
+downloads/
+inspect_out.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Python installers (too large for git)
+python-*.exe
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs / temp
+*.log
+tasks/
