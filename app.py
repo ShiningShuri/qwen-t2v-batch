@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).parent.resolve()
@@ -65,7 +65,8 @@ class Account:
     def __init__(self, idx: int, port: int):
         self.idx = idx
         self.port = port
-        self.profile_dir = ROOT / f"chrome-profile-{idx}"
+        # idx 1 reuses the original 'chrome-profile' folder; >=2 get a suffix.
+        self.profile_dir = ROOT / ("chrome-profile" if idx == 1 else f"chrome-profile-{idx}")
         self.proc: Optional[subprocess.Popen] = None
         self.scenes_done: list[int] = []
         self.scenes_failed: list[int] = []
@@ -110,15 +111,56 @@ class State:
         self.images_dir: str = ""
         self.prompts_file: str = ""
         self.suffix: str = ""
+        self._image_root = None  # resolved Path of the last-scanned image folder
         # scene_no -> {"state": pending|running|done|failed, "acc": idx|None}
         self.scenes: dict[int, dict] = {}
 
     def add_account(self) -> Account:
-        idx = len(self.accounts) + 1
+        # Reuse the lowest free idx so re-adding after a removal stays compact.
+        used = {a.idx for a in self.accounts}
+        idx = 1
+        while idx in used:
+            idx += 1
         port = 9222 + (idx - 1) * 2  # 9222, 9224, 9226, 9228, ...
         acc = Account(idx, port)
         self.accounts.append(acc)
+        self.accounts.sort(key=lambda a: a.idx)
         return acc
+
+    def add_accounts(self, n: int) -> list[Account]:
+        return [self.add_account() for _ in range(n)]
+
+    def restore_accounts(self) -> list[Account]:
+        """Recreate Account objects from existing chrome-profile-* folders so a
+        server restart keeps every logged-in account instead of starting empty.
+
+        Profile dirs are named 'chrome-profile' (idx 1) and 'chrome-profile-N'
+        (idx N>=2) — matches Account.profile_dir below."""
+        found: list[int] = []
+        for p in ROOT.glob("chrome-profile*"):
+            if not p.is_dir():
+                continue
+            name = p.name
+            if name == "chrome-profile":
+                found.append(1)
+            else:
+                m = re.fullmatch(r"chrome-profile-(\d+)", name)
+                if m:
+                    found.append(int(m.group(1)))
+        existing = {a.idx for a in self.accounts}
+        restored: list[Account] = []
+        for idx in sorted(set(found)):
+            if idx in existing:
+                continue
+            port = 9222 + (idx - 1) * 2
+            acc = Account(idx, port)
+            # If its debug Chrome is already running, mark it live.
+            if cdp_alive(port):
+                acc.status = "logged-in"
+            self.accounts.append(acc)
+            restored.append(acc)
+        self.accounts.sort(key=lambda a: a.idx)
+        return restored
 
     def log(self, line: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -192,13 +234,35 @@ PAGE = """<!doctype html>
           <span class="w-6 h-6 rounded-full bg-indigo-600 text-xs flex items-center justify-center font-bold">1</span>
           Qwen 계정
         </h2>
-        <button @click="addAccount()" class="text-sm bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded font-medium">
-          + 계정 추가
-        </button>
+        <span class="text-[11px] text-slate-400">로그인 완료
+          <span class="text-emerald-400 font-bold" x-text="loggedInCount"></span> / <span x-text="accounts.length"></span></span>
       </div>
       <p class="text-xs text-slate-400 mb-3 leading-relaxed">
-        하나의 계정 = 하나의 Chrome 창. 각 Chrome에서 다른 Qwen 계정으로 로그인하면 한도가 N배.
+        한 계정 = Chrome 창 1개(프로필 분리). 각 창에서 다른 Qwen 계정 로그인 → 한도 N배.
+        한 번에 여러 개 만들고 창마다 로그인만 하면 됨.
       </p>
+
+      <!-- bulk add -->
+      <div class="flex items-end gap-2 mb-2">
+        <label class="flex-1">
+          <span class="block text-[11px] text-slate-400 mb-1">계정 개수</span>
+          <input x-model.number="addCount" type="number" min="1" max="20"
+            class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none">
+        </label>
+        <button @click="addAccountsBulk()"
+          class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded font-medium text-sm whitespace-nowrap">
+          + N개 추가 & Chrome 열기
+        </button>
+      </div>
+      <div class="flex gap-2 mb-3">
+        <button @click="openAll()" class="flex-1 text-xs bg-slate-800 hover:bg-slate-700 px-2 py-1.5 rounded">
+          🖥 닫힌 창 다시 열기
+        </button>
+        <button @click="checkAll()" class="flex-1 text-xs bg-emerald-700 hover:bg-emerald-600 px-2 py-1.5 rounded font-medium">
+          ✓ 전체 로그인 확인
+        </button>
+      </div>
+
       <div class="space-y-2">
         <template x-for="a in accounts" :key="a.idx">
           <div class="bg-slate-800/60 border border-slate-700/50 rounded-lg p-3">
@@ -223,12 +287,14 @@ PAGE = """<!doctype html>
                 class="flex-1 text-xs bg-slate-700 hover:bg-slate-600 px-2 py-1 rounded">
                 로그인 확인
               </button>
+              <button @click="removeAccount(a.idx)"
+                class="text-xs bg-slate-700 hover:bg-rose-700 px-2 py-1 rounded" title="목록에서 제거">✕</button>
             </div>
           </div>
         </template>
         <template x-if="accounts.length === 0">
           <div class="text-center text-slate-500 text-sm py-6 border border-dashed border-slate-800 rounded-lg">
-            계정 추가를 눌러 시작
+            위에서 계정 개수를 정하고 추가하세요
           </div>
         </template>
       </div>
@@ -243,26 +309,25 @@ PAGE = """<!doctype html>
       <div class="space-y-3 text-sm">
         <label class="block">
           <span class="block text-xs text-slate-400 mb-1">이미지 폴더</span>
-          <input x-model="images" type="text" placeholder="C:\\Users\\you\\images"
+          <div class="flex gap-2">
+            <input x-model="images" type="text" placeholder="C:\\Users\\you\\images"
+              class="flex-1 bg-slate-950 border border-slate-700 rounded px-3 py-2 mono text-xs focus:border-indigo-500 focus:outline-none">
+            <button @click="scanImages()"
+              class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded text-xs font-medium whitespace-nowrap">
+              📂 불러오기
+            </button>
+          </div>
+        </label>
+        <label class="block">
+          <span class="block text-xs text-slate-400 mb-1">프롬프트 파일 (.txt) — <span class="text-slate-500">비워두면 공용 영상화 프롬프트만 사용</span></span>
+          <input x-model="prompts" type="text" placeholder="(선택) C:\\Users\\you\\prompts.txt"
             class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 mono text-xs focus:border-indigo-500 focus:outline-none">
         </label>
         <label class="block">
-          <span class="block text-xs text-slate-400 mb-1">프롬프트 파일 (.txt)</span>
-          <input x-model="prompts" type="text" placeholder="C:\\Users\\you\\prompts.txt"
-            class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 mono text-xs focus:border-indigo-500 focus:outline-none">
+          <span class="block text-xs text-slate-400 mb-1">접미사 (선택) — 파일명 충돌 방지</span>
+          <input x-model="suffix" type="text" placeholder="remake"
+            class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs focus:border-indigo-500 focus:outline-none">
         </label>
-        <div class="grid grid-cols-2 gap-3">
-          <label class="block">
-            <span class="block text-xs text-slate-400 mb-1">시작 씬</span>
-            <input x-model.number="start" type="number" min="1"
-              class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs focus:border-indigo-500 focus:outline-none">
-          </label>
-          <label class="block">
-            <span class="block text-xs text-slate-400 mb-1">접미사 (선택)</span>
-            <input x-model="suffix" type="text" placeholder="remake"
-              class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-xs focus:border-indigo-500 focus:outline-none">
-          </label>
-        </div>
       </div>
     </section>
 
@@ -292,30 +357,51 @@ PAGE = """<!doctype html>
   <!-- right column: scenes + log -->
   <div class="lg:col-span-2 space-y-4">
 
-    <!-- progress -->
+    <!-- progress + image grid -->
     <section class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
       <div class="flex items-center justify-between mb-2">
-        <h2 class="font-semibold">씬 진행 상태</h2>
+        <h2 class="font-semibold">이미지 선택 → 영상 생성</h2>
         <div class="text-xs text-slate-400">
-          <span x-text="totalDone"></span> / <span x-text="totalPlanned || scenes.length"></span> 완료
+          선택 <span class="text-indigo-300 font-bold" x-text="selectedCount"></span> ·
+          완료 <span x-text="totalDone"></span> / <span x-text="totalPlanned || scenes.length"></span>
         </div>
       </div>
-      <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden mb-3">
+
+      <div class="flex items-center gap-2 mb-3" x-show="scenes.length">
+        <button @click="selectAll()" class="text-[11px] bg-slate-800 hover:bg-slate-700 px-2.5 py-1 rounded">전체 선택</button>
+        <button @click="selectNone()" class="text-[11px] bg-slate-800 hover:bg-slate-700 px-2.5 py-1 rounded">선택 해제</button>
+        <span class="text-[11px] text-slate-500 ml-auto">컷을 클릭해 만들 영상만 고르세요 (아무것도 안 고르면 전체 생성)</span>
+      </div>
+
+      <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden mb-3" x-show="scenes.length">
         <div class="h-full bg-gradient-to-r from-emerald-500 to-teal-500 transition-all"
              :class="anyRunning ? 'stripes' : ''"
              :style="{width: progressPct + '%'}"></div>
       </div>
-      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+
+      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">
         <template x-for="s in scenes" :key="s.no">
-          <div class="aspect-square rounded-md border flex flex-col items-center justify-center text-center p-1 transition-all"
+          <button @click="toggleScene(s.no)"
+               class="relative aspect-square rounded-lg border-2 overflow-hidden group transition-all text-left"
                :class="sceneCardClass(s)">
-            <div class="text-xs font-bold mono" x-text="s.no.toString().padStart(2,'0')"></div>
-            <div class="text-[9px] mt-0.5 opacity-80" x-text="sceneStatus(s)"></div>
-          </div>
+            <template x-if="s.thumb">
+              <img :src="s.thumb" loading="lazy" class="absolute inset-0 w-full h-full object-cover"
+                   :class="selected.includes(s.no) ? 'opacity-100' : 'opacity-50 group-hover:opacity-80'">
+            </template>
+            <!-- selection check -->
+            <div class="absolute top-1 left-1 w-5 h-5 rounded-full flex items-center justify-center text-[11px] font-bold border"
+                 :class="selected.includes(s.no) ? 'bg-indigo-500 border-indigo-300 text-white' : 'bg-black/50 border-slate-400 text-transparent'">✓</div>
+            <!-- scene no + state badge -->
+            <div class="absolute bottom-0 inset-x-0 bg-black/60 backdrop-blur-sm px-1.5 py-0.5 flex items-center justify-between">
+              <span class="text-[10px] font-bold mono text-white" x-text="s.no.toString().padStart(2,'0')"></span>
+              <span class="text-[9px] font-medium" :class="stateBadgeColor(s)" x-text="sceneStatus(s)"></span>
+            </div>
+          </button>
         </template>
         <template x-if="scenes.length === 0">
-          <div class="col-span-full text-center text-slate-500 text-sm py-6">
-            프롬프트 파일 + 이미지 폴더 경로를 입력하면 씬 카드가 표시됨
+          <div class="col-span-full text-center text-slate-500 text-sm py-10">
+            이미지 폴더 경로 입력 후 <b>📂 불러오기</b>를 누르면 컷 썸네일이 표시됩니다.<br>
+            <span class="text-xs text-slate-600">파일명은 scene_01.jpg, scene_02.png … 형식</span>
           </div>
         </template>
       </div>
@@ -345,11 +431,13 @@ function app() {
   return {
     accounts: [],
     scenes: [],
+    selected: [],      // scene numbers the user picked in the grid
     logs: [],
     images: '',
     prompts: '',
     suffix: '',
     start: 1,
+    addCount: 3,
     logCounter: 0,
     get anyRunning() {
       return this.accounts.some(a => a.status === 'running' || a.status === 'starting');
@@ -364,6 +452,10 @@ function app() {
       const t = this.totalPlanned;
       return t ? Math.round(this.totalDone / t * 100) : 0;
     },
+    get loggedInCount() {
+      return this.accounts.filter(a => a.status === 'logged-in' || a.status === 'running').length;
+    },
+    get selectedCount() { return this.selected.length; },
     statusText(s) {
       return ({
         'stopped': '중지됨', 'starting': '시작 중', 'logged-in': '로그인 완료',
@@ -381,10 +473,16 @@ function app() {
       })[s] || 'bg-slate-700';
     },
     sceneCardClass(s) {
-      if (s.state === 'done') return 'bg-emerald-600/15 border-emerald-500/40 text-emerald-200';
-      if (s.state === 'failed') return 'bg-rose-600/15 border-rose-500/40 text-rose-200';
-      if (s.state === 'running') return 'bg-sky-600/15 border-sky-500/40 text-sky-200 animate-pulse';
-      return 'bg-slate-800/30 border-slate-700/40 text-slate-400';
+      const sel = this.selected.includes(s.no);
+      if (s.state === 'done')    return 'border-emerald-400 ring-2 ring-emerald-500/40';
+      if (s.state === 'failed')  return 'border-rose-400 ring-2 ring-rose-500/40';
+      if (s.state === 'running') return 'border-sky-400 ring-2 ring-sky-400/50 animate-pulse';
+      return sel ? 'border-indigo-400 ring-2 ring-indigo-500/40'
+                 : 'border-slate-700/60 hover:border-slate-500';
+    },
+    stateBadgeColor(s) {
+      return ({ done:'text-emerald-300', failed:'text-rose-300',
+                running:'text-sky-300', pending:'text-slate-400' })[s.state] || 'text-slate-400';
     },
     sceneStatus(s) {
       return ({ done:'완료', failed:'실패', running:'진행', pending:'대기' })[s.state] || s.state;
@@ -399,10 +497,45 @@ function app() {
     async refresh() {
       const r = await fetch('/state').then(r => r.json());
       this.accounts = r.accounts;
-      this.scenes = r.scenes;
+      // Merge state updates into existing scene cards WITHOUT losing thumbnails.
+      const byNo = {};
+      this.scenes.forEach(s => byNo[s.no] = s);
+      r.scenes.forEach(rs => {
+        if (byNo[rs.no]) byNo[rs.no].state = rs.state;   // keep thumb/file
+        else this.scenes.push(rs);
+      });
     },
-    async addAccount() {
-      await fetch('/account/add', { method: 'POST' });
+    async scanImages() {
+      if (!this.images) { alert('이미지 폴더 경로를 입력하세요'); return; }
+      const body = new URLSearchParams({ images: this.images, prompts: this.prompts });
+      const r = await fetch('/scan', { method: 'POST', body }).then(r => r.json());
+      if (r.error) { alert(r.error); return; }
+      this.scenes = r.scenes;
+      this.selected = [];   // start empty = "generate all" by default
+    },
+    toggleScene(no) {
+      const i = this.selected.indexOf(no);
+      if (i >= 0) this.selected.splice(i, 1);
+      else this.selected.push(no);
+    },
+    selectAll() { this.selected = this.scenes.map(s => s.no); },
+    selectNone() { this.selected = []; },
+    async addAccountsBulk() {
+      const n = Math.max(1, Math.min(this.addCount || 1, 20));
+      const body = new URLSearchParams({ count: n, open_chrome: 'true' });
+      await fetch('/account/add-bulk', { method: 'POST', body });
+      await this.refresh();
+    },
+    async openAll() {
+      await fetch('/account/open-all', { method: 'POST' });
+      await this.refresh();
+    },
+    async checkAll() {
+      await fetch('/account/check-all', { method: 'POST' });
+      await this.refresh();
+    },
+    async removeAccount(idx) {
+      await fetch(`/account/${idx}/remove`, { method: 'POST' });
       await this.refresh();
     },
     async startChrome(idx) {
@@ -414,9 +547,11 @@ function app() {
       await this.refresh();
     },
     async startBatch() {
+      if (this.loggedInCount === 0) { alert('로그인된 계정이 없습니다. 계정 추가 → 각 Chrome 로그인 → 전체 로그인 확인'); return; }
       const body = new URLSearchParams({
         images: this.images, prompts: this.prompts,
         suffix: this.suffix, start: this.start,
+        scenes: this.selected.join(','),   // empty = run all
       });
       const r = await fetch('/batch/start', { method: 'POST', body });
       if (!r.ok) {
@@ -438,7 +573,8 @@ function app() {
           if (p) p.scrollTop = p.scrollHeight;
         });
       };
-      this.refresh();
+      // Restore accounts from existing chrome-profile-* folders on load.
+      fetch('/account/restore', { method: 'POST' }).then(() => this.refresh());
       setInterval(() => this.refresh(), 2000);
     },
   };
@@ -476,19 +612,53 @@ async def full_state():
 
 
 @app.post("/scan")
-async def scan_inputs(images: str = Form(...), prompts: str = Form(...)):
-    """Build the scene plan from the inputs without starting anything."""
-    if not Path(images).is_dir() or not Path(prompts).is_file():
-        return {"scenes": []}
+async def scan_inputs(images: str = Form(...), prompts: str = Form("")):
+    """Scan an image folder into scene cards. `prompts` is optional now:
+    with no prompts file, every image still becomes a scene using the common
+    wrapper-only prompt. Returns thumbnails so the UI shows a clickable grid."""
+    img_dir = Path(images)
+    if not img_dir.is_dir():
+        return {"scenes": [], "error": "image folder not found"}
+
     sys.path.insert(0, str(ROOT))
     from main import parse_prompts, find_images  # type: ignore
-    scenes = parse_prompts(Path(prompts))
-    imgs = find_images(Path(images))
-    state.scenes = {
-        n: {"state": "pending", "acc": None}
-        for n, _ in scenes if n in imgs
-    }
-    return {"scenes": [{"no": n, "state": "pending"} for n in sorted(state.scenes)]}
+
+    imgs = find_images(img_dir)  # {scene_no: Path}
+    have_prompts = bool(prompts) and Path(prompts).is_file()
+    prompt_nos = {n for n, _ in parse_prompts(Path(prompts))} if have_prompts else set()
+
+    state.images_dir = images
+    state.prompts_file = prompts if have_prompts else ""
+    # Remember the folder we're allowed to serve thumbnails from (path-safety).
+    state._image_root = img_dir.resolve()  # type: ignore[attr-defined]
+
+    state.scenes = {n: {"state": "pending", "acc": None} for n in sorted(imgs)}
+    scenes = []
+    for n in sorted(imgs):
+        scenes.append({
+            "no": n,
+            "state": "pending",
+            "file": imgs[n].name,
+            "thumb": f"/image?file={imgs[n].name}",
+            "has_prompt": (n in prompt_nos) if have_prompts else False,
+        })
+    return {"scenes": scenes, "have_prompts": have_prompts}
+
+
+@app.get("/image")
+async def serve_image(file: str):
+    """Serve one image from the last-scanned folder. Only basenames inside that
+    folder are allowed — prevents path traversal to arbitrary disk files."""
+    root = getattr(state, "_image_root", None)
+    if root is None:
+        raise HTTPException(404, "no image folder scanned yet")
+    # Reject any path component / traversal — must be a plain filename.
+    if "/" in file or "\\" in file or ".." in file:
+        raise HTTPException(400, "invalid filename")
+    target = (Path(root) / file).resolve()
+    if Path(root) not in target.parents or not target.is_file():
+        raise HTTPException(404, "image not found")
+    return FileResponse(str(target))
 
 
 @app.post("/account/add")
@@ -496,6 +666,94 @@ async def account_add():
     acc = state.add_account()
     state.log(f"account #{acc.idx} added (port {acc.port})")
     return {"ok": True, "idx": acc.idx}
+
+
+@app.post("/account/add-bulk")
+async def account_add_bulk(count: int = Form(...), open_chrome: bool = Form(True)):
+    """Add N accounts at once and (optionally) launch every Chrome window so the
+    user only logs in — no per-account 'add → open → check' clicking."""
+    count = max(1, min(count, 20))  # sanity cap
+    accs = state.add_accounts(count)
+    state.log(f"added {count} account(s): {[a.idx for a in accs]}")
+    if open_chrome:
+        for acc in accs:
+            try:
+                acc.start_chrome()
+                state.log(f"account #{acc.idx} Chrome opening on port {acc.port}")
+            except Exception as e:  # noqa: BLE001
+                acc.status = "error"
+                state.log(f"account #{acc.idx} Chrome start failed: {e!r}")
+    return {"ok": True, "idxs": [a.idx for a in accs]}
+
+
+@app.post("/account/restore")
+async def account_restore(open_chrome: bool = Form(False)):
+    """Rebuild accounts from existing chrome-profile-* folders (survive restart)."""
+    restored = state.restore_accounts()
+    state.log(f"restored {len(restored)} account(s) from disk: {[a.idx for a in restored]}")
+    if open_chrome:
+        for acc in restored:
+            if not cdp_alive(acc.port):
+                try:
+                    acc.start_chrome()
+                except Exception as e:  # noqa: BLE001
+                    acc.status = "error"
+                    state.log(f"account #{acc.idx} Chrome start failed: {e!r}")
+    return {"ok": True, "idxs": [a.idx for a in restored]}
+
+
+@app.post("/account/open-all")
+async def account_open_all():
+    """Launch Chrome for every account whose debug port is not already alive."""
+    opened = []
+    for acc in state.accounts:
+        if cdp_alive(acc.port):
+            acc.status = "logged-in"
+            continue
+        try:
+            acc.start_chrome()
+            opened.append(acc.idx)
+        except Exception as e:  # noqa: BLE001
+            acc.status = "error"
+            state.log(f"account #{acc.idx} Chrome start failed: {e!r}")
+    state.log(f"open-all: launched Chrome for accounts {opened}")
+    return {"ok": True, "opened": opened}
+
+
+@app.post("/account/check-all")
+async def account_check_all():
+    """Check login status of every account in one pass (no per-card clicking)."""
+    from playwright.async_api import async_playwright
+    async with async_playwright() as pw:
+        for acc in state.accounts:
+            if not cdp_alive(acc.port):
+                acc.status = "stopped"
+                continue
+            try:
+                browser = await pw.chromium.connect_over_cdp(f"http://localhost:{acc.port}")
+                ctx = browser.contexts[0] if browser.contexts else None
+                if ctx and any("qwen.ai" in (p.url or "") for p in ctx.pages):
+                    acc.status = "logged-in"
+                else:
+                    acc.status = "starting"
+                await browser.close()
+            except Exception as e:  # noqa: BLE001
+                state.log(f"account #{acc.idx} check error: {e!r}")
+                acc.status = "error"
+    logged = [a.idx for a in state.accounts if a.status == "logged-in"]
+    state.log(f"check-all: logged-in accounts {logged}")
+    return {"ok": True, "logged_in": logged}
+
+
+@app.post("/account/{idx}/remove")
+async def account_remove(idx: int):
+    acc = next((a for a in state.accounts if a.idx == idx), None)
+    if not acc:
+        raise HTTPException(404, "account not found")
+    # Don't kill its Chrome — user may still be using it; just drop from rotation.
+    state.accounts = [a for a in state.accounts if a.idx != idx]
+    state.log(f"account #{idx} removed from rotation")
+    return {"ok": True}
 
 
 @app.post("/account/{idx}/start-chrome")
@@ -541,52 +799,72 @@ async def account_check_login(idx: int):
 @app.post("/batch/start")
 async def batch_start(
     images: str = Form(...),
-    prompts: str = Form(...),
+    prompts: str = Form(""),
     suffix: str = Form(""),
     start: int = Form(1),
+    scenes: str = Form(""),  # optional CSV of scene numbers to run ONLY these
 ):
     if state.running:
         raise HTTPException(409, "already running")
     if not Path(images).is_dir():
         raise HTTPException(400, f"image folder not found: {images}")
-    if not Path(prompts).is_file():
-        raise HTTPException(400, f"prompts file not found: {prompts}")
+    have_prompts = bool(prompts) and Path(prompts).is_file()
     logged = [a for a in state.accounts if a.status == "logged-in"]
     if not logged:
-        raise HTTPException(400, "no logged-in account. add account, start chrome, log in, then 'check login'.")
+        raise HTTPException(400, "no logged-in account. add accounts, open Chrome, log in, then 'check all'.")
 
     state.images_dir = images
-    state.prompts_file = prompts
+    state.prompts_file = prompts if have_prompts else ""
     state.suffix = suffix
     state.running = True
 
-    # parse scene numbers (use the same parser as main.py)
     sys.path.insert(0, str(ROOT))
     from main import parse_prompts, find_images  # type: ignore
 
-    scenes = parse_prompts(Path(prompts))
     imgs = find_images(Path(images))
-    work = [(n, blk) for n, blk in scenes if n in imgs and n >= start]
+    prompt_nos = {n for n, _ in parse_prompts(Path(prompts))} if have_prompts else set()
+
+    # Explicit selection (from the image grid) overrides start-based range.
+    selected: set[int] | None = None
+    if scenes.strip():
+        try:
+            selected = {int(x) for x in scenes.split(",") if x.strip()}
+        except ValueError:
+            state.running = False
+            raise HTTPException(400, f"bad scenes list: {scenes!r}")
+
+    work: list[int] = []
+    for n in sorted(imgs):
+        if selected is not None:
+            if n not in selected:
+                continue
+        elif n < start:
+            continue
+        work.append(n)
+
     if not work:
         state.running = False
-        raise HTTPException(400, "no scenes to run (check start + image filenames)")
+        raise HTTPException(400, "no scenes to run (check selection / start / image filenames)")
 
     # build scene plan + distribute round-robin across logged-in accounts
-    state.scenes = {n: {"state": "pending", "acc": None} for n, _ in work}
+    state.scenes = {n: {"state": "pending", "acc": None} for n in work}
     buckets: dict[int, list[int]] = {a.idx: [] for a in logged}
-    for i, (n, _blk) in enumerate(work):
+    for i, n in enumerate(work):
         acc = logged[i % len(logged)]
         buckets[acc.idx].append(n)
         state.scenes[n]["acc"] = acc.idx
 
-    state.log(f"batch start: {len(work)} scenes across {len(logged)} account(s)")
+    mode = "with prompts" if have_prompts else "wrapper-only (no prompt file)"
+    state.log(f"batch start: {len(work)} scenes across {len(logged)} account(s) [{mode}]")
     for acc in logged:
         scenes_for = buckets[acc.idx]
         state.log(f"  account #{acc.idx} -> scenes {scenes_for}")
-        task = asyncio.create_task(run_worker(acc, scenes_for, images, prompts, suffix))
+        task = asyncio.create_task(
+            run_worker(acc, scenes_for, images, state.prompts_file, suffix)
+        )
         state.workers.append(task)
 
-    return {"ok": True, "workers": len(state.workers)}
+    return {"ok": True, "workers": len(state.workers), "scenes": work}
 
 
 async def run_worker(acc: Account, scenes: list[int], images: str, prompts: str, suffix: str) -> None:
@@ -602,12 +880,13 @@ async def run_worker(acc: Account, scenes: list[int], images: str, prompts: str,
             PY,
             str(ROOT / "main.py"),
             "--images", images,
-            "--prompts", prompts,
             "--cdp", f"http://localhost:{acc.port}",
             "--start", str(n),
             "--limit", "1",
             "--tabs", "1",
         ]
+        if prompts:
+            cmd += ["--prompts", prompts]
         if suffix:
             cmd += ["--suffix", suffix]
         state.log(f"[acc#{acc.idx}] scene {n:02d} starting")

@@ -79,7 +79,9 @@ def sanitize_for_safety(text: str) -> str:
 COMPOSER_PLACEHOLDER_RE = re.compile("도와드릴까요|설명하세요|describe", re.IGNORECASE)
 
 
-def parse_prompts(prompts_path: Path) -> list[tuple[int, str]]:
+def parse_prompts(prompts_path: Path | None) -> list[tuple[int, str]]:
+    if prompts_path is None:
+        return []
     text = prompts_path.read_text(encoding="utf-8")
     matches = list(SCENE_HEADER_RE.finditer(text))
     if not matches:
@@ -401,9 +403,19 @@ async def run(
     start: int = 1,
     suffix: str = "",
 ) -> None:
-    scenes = parse_prompts(prompts_file)
     images = find_images(images_dir)
-    work = [(n, images[n], blk) for n, blk in scenes if n in images and n >= start]
+    if prompts_file is not None:
+        scenes = parse_prompts(prompts_file)
+        blocks = {n: blk for n, blk in scenes}
+    else:
+        # No prompt file: every image becomes a scene with an empty block, so
+        # only the common cinematic wrapper is sent to Qwen.
+        blocks = {n: "" for n in images}
+    work = [
+        (n, images[n], blocks[n])
+        for n in sorted(images)
+        if n in blocks and n >= start
+    ]
     if limit > 0:
         work = work[:limit]
     if not work:
@@ -473,7 +485,8 @@ async def run(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--images", required=True, type=Path)
-    ap.add_argument("--prompts", required=True, type=Path)
+    ap.add_argument("--prompts", type=Path, default=None,
+                    help="Prompt file. Optional: omit to use wrapper-only prompt for every image.")
     ap.add_argument("--cdp", default="http://localhost:9222", help="Chrome DevTools Protocol endpoint")
     ap.add_argument("--tabs", type=int, default=1)
     ap.add_argument("--limit", type=int, default=1, help="Only run first N scenes (default 1 for safety). 0 = all.")
@@ -491,9 +504,12 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.preview:
-        scenes = parse_prompts(args.prompts)
         images = find_images(args.images)
-        for n, blk in scenes:
+        if args.prompts is not None:
+            scene_blocks = parse_prompts(args.prompts)
+        else:
+            scene_blocks = [(n, "") for n in sorted(images)]
+        for n, blk in scene_blocks:
             img = images.get(n)
             sep = "=" * 70
             print(f"\n{sep}\n[scene {n:02d}] image: {img.name if img else 'MISSING'}\n{sep}")

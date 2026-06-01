@@ -1,7 +1,5 @@
-# Browser profiles (per-user)
-chrome-profile/
-chrome-profile-2/
-chrome-profile-3/
+# Browser profiles (per-user) — NEVER commit, they hold login cookies
+chrome-profile*/
 edge-profile/
 profile/
 
@@ -30,3 +28,7 @@ Thumbs.db
 # Logs / temp
 *.log
 tasks/
+
+# Release build output
+dist/
+get-pip.py
